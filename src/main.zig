@@ -3,152 +3,177 @@ const std = @import("std");
 const solar_mass = 4.0 * std.math.pi * std.math.pi;
 const days_per_year = 365.24;
 
-const n_bodies = 5;
-const n_pairs = n_bodies * (n_bodies - 1) / 2; // 10
-const simd_width = 4;
-const n_padded = ((n_pairs + simd_width - 1) / simd_width) * simd_width; // 12
-const n_chunks = n_padded / simd_width; // 3
+const N = 5;
+const PAIRS = N * (N - 1) / 2; // 10
 
-const V4 = @Vector(simd_width, f64);
+const V4 = @Vector(4, f64);
+const V4f = @Vector(4, f32);
 
-// SoA layout
-var x: [n_bodies]f64 = undefined;
-var y: [n_bodies]f64 = undefined;
-var z: [n_bodies]f64 = undefined;
-var vx: [n_bodies]f64 = undefined;
-var vy: [n_bodies]f64 = undefined;
-var vz: [n_bodies]f64 = undefined;
-var mass: [n_bodies]f64 = undefined;
-
-// Comptime pair index tables
-const pair_i = blk: {
-    var arr: [n_padded]usize = undefined;
-    var k: usize = 0;
-    for (0..n_bodies) |i| {
-        for (i + 1..n_bodies) |_| {
-            arr[k] = i;
-            k += 1;
-        }
-    }
-    while (k < n_padded) : (k += 1) arr[k] = 0;
-    break :blk arr;
-};
-
-const pair_j = blk: {
-    var arr: [n_padded]usize = undefined;
-    var k: usize = 0;
-    for (0..n_bodies) |i| {
-        for (i + 1..n_bodies) |j| {
-            arr[k] = j;
-            k += 1;
-        }
-    }
-    while (k < n_padded) : (k += 1) arr[k] = 0;
-    break :blk arr;
-};
-
-fn initBodies() void {
-    const init_x = [n_bodies]f64{ 0, 4.84143144246472090e+00, 8.34336671824457987e+00, 1.28943695621391310e+01, 1.53796971148509165e+01 };
-    const init_y = [n_bodies]f64{ 0, -1.16032004402742839e+00, 4.12479856412430479e+00, -1.51111514016986312e+01, -2.59193146099879641e+01 };
-    const init_z = [n_bodies]f64{ 0, -1.03622044471123109e-01, -4.03523417114321381e-01, -2.23307578892655734e-01, 1.79258772950371181e-01 };
-    const init_vx = [n_bodies]f64{ 0, 1.66007664274403694e-03 * days_per_year, -2.76742510726862411e-03 * days_per_year, 2.96460137564761618e-03 * days_per_year, 2.68067772490389322e-03 * days_per_year };
-    const init_vy = [n_bodies]f64{ 0, 7.69901118419740425e-03 * days_per_year, 4.99852801234917238e-03 * days_per_year, 2.37847173959480950e-03 * days_per_year, 1.62824170038242295e-03 * days_per_year };
-    const init_vz = [n_bodies]f64{ 0, -6.90460016972063023e-05 * days_per_year, 2.30417297573763929e-05 * days_per_year, -2.96589568540237556e-05 * days_per_year, -9.51592254519715870e-05 * days_per_year };
-    const init_mass = [n_bodies]f64{ solar_mass, 9.54791938424326609e-04 * solar_mass, 2.85885980666130812e-04 * solar_mass, 4.36624404335156298e-05 * solar_mass, 5.15138902046611451e-05 * solar_mass };
-
-    x = init_x;
-    y = init_y;
-    z = init_z;
-    vx = init_vx;
-    vy = init_vy;
-    vz = init_vz;
-    mass = init_mass;
+// Approximate 1/sqrt(x) using vrsqrtps + Goldschmidt refinement (matches C version)
+inline fn rsqrt_v4(s: V4) V4 {
+    const q: V4f = @floatCast(s);
+    const r: V4f = asm ("vrsqrtps %[src], %[dst]"
+        : [dst] "=x" (-> V4f),
+        : [src] "x" (q),
+    );
+    const x_init: V4 = @floatCast(r);
+    const y = s * x_init * x_init;
+    const a = y * @as(V4, @splat(0.375)) * y;
+    const b = y * @as(V4, @splat(1.25)) - @as(V4, @splat(1.875));
+    return x_init * (a - b);
 }
 
-fn advance(dt: f64) void {
-    // SoA pair deltas stored flat for SIMD
-    var dx: [n_padded]f64 align(32) = undefined;
-    var dy: [n_padded]f64 align(32) = undefined;
-    var dz: [n_padded]f64 align(32) = undefined;
-    var mag_arr: [n_padded]f64 align(32) = undefined;
+// Horizontal sum of squared components for 4 V4 vectors -> V4 of distance²
+// Each V4 is (_, x, y, z); we want x²+y²+z² for each
+inline fn hsum_sq4(r0: V4, r1: V4, r2: V4, r3: V4) V4 {
+    const x0 = r0 * r0;
+    const x1 = r1 * r1;
+    const x2 = r2 * r2;
+    const x3 = r3 * r3;
 
-    // Compute deltas (unrolled at comptime)
-    inline for (0..n_pairs) |k| {
-        dx[k] = x[pair_i[k]] - x[pair_j[k]];
-        dy[k] = y[pair_i[k]] - y[pair_j[k]];
-        dz[k] = z[pair_i[k]] - z[pair_j[k]];
+    // hadd pairs: t0 = hadd(x0, x1), t1 = hadd(x2, x3)
+    const t0: V4 = asm ("vhaddpd %[b], %[a], %[dst]"
+        : [dst] "=x" (-> V4),
+        : [a] "x" (x0),
+          [b] "x" (x1),
+    );
+    const t1: V4 = asm ("vhaddpd %[b], %[a], %[dst]"
+        : [dst] "=x" (-> V4),
+        : [a] "x" (x2),
+          [b] "x" (x3),
+    );
+
+    // permute + blend to finish horizontal reduction
+    const y0: V4 = asm ("vperm2f128 $0x21, %[b], %[a], %[dst]"
+        : [dst] "=x" (-> V4),
+        : [a] "x" (t0),
+          [b] "x" (t1),
+    );
+    const y1: V4 = asm ("vblendpd $0b1100, %[b], %[a], %[dst]"
+        : [dst] "=x" (-> V4),
+        : [a] "x" (t0),
+          [b] "x" (t1),
+    );
+
+    return y0 + y1;
+}
+
+// Body data: each body stored as V4 = (_, x, y, z)
+var mass: [N]f64 = undefined;
+var pos: [N]V4 = undefined;
+var vel: [N]V4 = undefined;
+
+fn initBodies() void {
+    // sun
+    mass[0] = solar_mass;
+    pos[0] = @splat(0.0);
+    vel[0] = @splat(0.0);
+
+    // jupiter
+    mass[1] = 9.54791938424326609e-04 * solar_mass;
+    pos[1] = V4{ 0, 4.84143144246472090e+00, -1.16032004402742839e+00, -1.03622044471123109e-01 };
+    vel[1] = V4{ 0, 1.66007664274403694e-03 * days_per_year, 7.69901118419740425e-03 * days_per_year, -6.90460016972063023e-05 * days_per_year };
+
+    // saturn
+    mass[2] = 2.85885980666130812e-04 * solar_mass;
+    pos[2] = V4{ 0, 8.34336671824457987e+00, 4.12479856412430479e+00, -4.03523417114321381e-01 };
+    vel[2] = V4{ 0, -2.76742510726862411e-03 * days_per_year, 4.99852801234917238e-03 * days_per_year, 2.30417297573763929e-05 * days_per_year };
+
+    // uranus
+    mass[3] = 4.36624404335156298e-05 * solar_mass;
+    pos[3] = V4{ 0, 1.28943695621391310e+01, -1.51111514016986312e+01, -2.23307578892655734e-01 };
+    vel[3] = V4{ 0, 2.96460137564761618e-03 * days_per_year, 2.37847173959480950e-03 * days_per_year, -2.96589568540237556e-05 * days_per_year };
+
+    // neptune
+    mass[4] = 5.15138902046611451e-05 * solar_mass;
+    pos[4] = V4{ 0, 1.53796971148509165e+01, -2.59193146099879641e+01, 1.79258772950371181e-01 };
+    vel[4] = V4{ 0, 2.68067772490389322e-03 * days_per_year, 1.62824170038242295e-03 * days_per_year, -9.51592254519715870e-05 * days_per_year };
+}
+
+fn offsetMomentum() void {
+    var o: V4 = @splat(0.0);
+    for (0..N) |i| {
+        o += @as(V4, @splat(mass[i])) * vel[i];
     }
-    // Pad
-    inline for (n_pairs..n_padded) |k| {
-        dx[k] = 0;
-        dy[k] = 0;
-        dz[k] = 0;
+    vel[0] = o * @as(V4, @splat(-1.0 / solar_mass));
+}
+
+// Compute pair deltas and rsqrt of distances
+inline fn kernel(r: *[PAIRS + 3]V4, w: *align(32) [PAIRS + 3]f64) void {
+    var k: usize = 0;
+    for (1..N) |i| {
+        for (0..i) |j| {
+            r[k] = pos[i] - pos[j];
+            k += 1;
+        }
     }
 
-    // SIMD: compute mag = dt / (dsq * sqrt(dsq))
-    const dt_v: V4 = @splat(dt);
-    inline for (0..n_chunks) |c| {
-        const base = c * simd_width;
-        const vdx: V4 = @as(*align(32) const [simd_width]f64, @ptrCast(dx[base..][0..simd_width])).*;
-        const vdy: V4 = @as(*align(32) const [simd_width]f64, @ptrCast(dy[base..][0..simd_width])).*;
-        const vdz: V4 = @as(*align(32) const [simd_width]f64, @ptrCast(dz[base..][0..simd_width])).*;
-        const dsq = vdx * vdx + vdy * vdy + vdz * vdz;
-        const dist = @sqrt(dsq);
-        const mag_v = dt_v / (dsq * dist);
-        @as(*align(32) [simd_width]f64, @ptrCast(mag_arr[base..][0..simd_width])).* = mag_v;
+    // Process 4 pairs at a time
+    comptime var ck: usize = 0;
+    inline while (ck < PAIRS) : (ck += 4) {
+        const dsq = hsum_sq4(r[ck], r[ck + 1], r[ck + 2], r[ck + 3]);
+        const inv = rsqrt_v4(dsq);
+        @as(*align(32) [4]f64, @ptrCast(&w[ck])).* = @bitCast(inv);
+    }
+}
+
+fn advance(n_steps: usize, dt: f64) void {
+    var r: [PAIRS + 3]V4 = undefined;
+    var w: [PAIRS + 3]f64 align(32) = undefined;
+
+    // Pad with 1.0 to avoid division by zero in rsqrt
+    r[PAIRS] = @splat(1.0);
+    r[PAIRS + 1] = @splat(1.0);
+    r[PAIRS + 2] = @splat(1.0);
+
+    const rt: V4 = @splat(dt);
+
+    var rm: [N]V4 = undefined;
+    for (0..N) |i| {
+        rm[i] = @splat(mass[i]);
     }
 
-    // Update velocities (unrolled at comptime for zero-overhead indexing)
-    inline for (0..n_pairs) |k| {
-        const i = pair_i[k];
-        const j = pair_j[k];
-        const m = mag_arr[k];
-        const mmj = mass[j] * m;
-        const mmi = mass[i] * m;
+    for (0..n_steps) |_| {
+        kernel(&r, &w);
 
-        vx[i] -= dx[k] * mmj;
-        vy[i] -= dy[k] * mmj;
-        vz[i] -= dz[k] * mmj;
-        vx[j] += dx[k] * mmi;
-        vy[j] += dy[k] * mmi;
-        vz[j] += dz[k] * mmi;
-    }
+        // mag = rsqrt^2 * rsqrt * dt = dt / (dsq * sqrt(dsq))
+        comptime var ck: usize = 0;
+        inline while (ck < PAIRS) : (ck += 4) {
+            const wv: V4 = @as(*align(32) const [4]f64, @ptrCast(&w[ck])).*;
+            const mag = wv * wv * wv * rt;
+            @as(*align(32) [4]f64, @ptrCast(&w[ck])).* = @bitCast(mag);
+        }
 
-    // Update positions
-    inline for (0..n_bodies) |i| {
-        x[i] += dt * vx[i];
-        y[i] += dt * vy[i];
-        z[i] += dt * vz[i];
+        // Update velocities
+        var k: usize = 0;
+        for (1..N) |i| {
+            for (0..i) |j| {
+                const t: V4 = r[k] * @as(V4, @splat(w[k]));
+                vel[i] -= t * rm[j];
+                vel[j] += t * rm[i];
+                k += 1;
+            }
+        }
+
+        // Update positions
+        for (0..N) |i| {
+            pos[i] += vel[i] * rt;
+        }
     }
 }
 
 fn energy() f64 {
     var e: f64 = 0.0;
-    for (0..n_bodies) |i| {
-        e += 0.5 * mass[i] * (vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]);
-        for (i + 1..n_bodies) |j| {
-            const ddx = x[i] - x[j];
-            const ddy = y[i] - y[j];
-            const ddz = z[i] - z[j];
-            const dsq = ddx * ddx + ddy * ddy + ddz * ddz;
+    for (0..N) |i| {
+        const v = vel[i];
+        e += 0.5 * mass[i] * (v[1] * v[1] + v[2] * v[2] + v[3] * v[3]);
+        for (i + 1..N) |j| {
+            const d = pos[i] - pos[j];
+            const dsq = d[1] * d[1] + d[2] * d[2] + d[3] * d[3];
             e -= (mass[i] * mass[j]) / @sqrt(dsq);
         }
     }
     return e;
-}
-
-fn offsetMomentum() void {
-    var px: f64 = 0;
-    var py: f64 = 0;
-    var pz: f64 = 0;
-    for (0..n_bodies) |i| {
-        px += vx[i] * mass[i];
-        py += vy[i] * mass[i];
-        pz += vz[i] * mass[i];
-    }
-    vx[0] = -px / solar_mass;
-    vy[0] = -py / solar_mass;
-    vz[0] = -pz / solar_mass;
 }
 
 pub fn main() !void {
@@ -167,9 +192,7 @@ pub fn main() !void {
     offsetMomentum();
     try stdout.print("{d:.9}\n", .{energy()});
 
-    for (0..n) |_| {
-        advance(0.01);
-    }
+    advance(n, 0.01);
 
     try stdout.print("{d:.9}\n", .{energy()});
     try stdout.flush();
